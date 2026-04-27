@@ -1,0 +1,65 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill this out as completely as possible.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component
+      options:
+        - MCP Protocol (src/protocols/mcp.py)
+        - A2A Protocol (src/protocols/a2a.py)
+        - ACP Protocol (src/protocols/acp.py)
+        - ANP Protocol (src/protocols/anp.py)
+        - BaseAgent / SpecialistAgent (src/agent.py)
+        - ProtocolRouter (src/protocol_router.py)
+        - Memory Layer (src/memory.py)
+        - Security / AuditLog (src/security.py)
+        - Observability (src/observability.py)
+        - Router Pattern (src/patterns/router_agent.py)
+        - Planner-Executor Pattern (src/patterns/planner_executor.py)
+        - Swarm Pattern (src/patterns/swarm.py)
+        - Failure Handlers (src/failure/handlers.py)
+        - Messaging (src/messaging.py)
+        - Examples
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: Clear description of what happened vs what you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Create a BaseAgent with config...
+        2. Call agent.run(query="...")
+        3. See error...
+    validations:
+      required: true
+
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Error / Traceback
+      render: python
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python Version
+      placeholder: "e.g. 3.11.4"
+    validations:
+      required: true

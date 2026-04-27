@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dev deps
+        run: pip install ruff black isort mypy
+      - name: Lint (ruff)
+        run: ruff check src tests examples
+      - name: Format check (black)
+        run: black --check src tests examples
+      - name: Import order (isort)
+        run: isort --check-only src tests examples
+      - name: Type check (mypy)
+        run: mypy src --ignore-missing-imports
+
+  unit-tests:
+    name: Unit Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: quality
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dev deps
+        run: pip install pytest pytest-asyncio pytest-cov
+      - name: Run unit tests
+        run: pytest tests/unit -v --tb=short --cov=src --cov-report=xml
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        if: matrix.python-version == '3.11'
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install pytest pytest-asyncio
+      - name: Run integration tests
+        run: pytest tests/integration -v --tb=short
+
+  examples:
+    name: Run Examples
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run basic_delegation.py
+        run: python examples/basic_delegation.py
+      - name: Run swarm_example.py
+        run: python examples/swarm_example.py

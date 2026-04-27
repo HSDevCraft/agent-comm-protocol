@@ -1,0 +1,42 @@
+name: Feature Request
+description: Propose a new feature or enhancement
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Feature Area
+      options:
+        - New Protocol Support
+        - New Design Pattern
+        - Memory Layer Enhancement
+        - Security / Identity
+        - Observability / Tracing
+        - Failure Resilience
+        - Performance
+        - Documentation
+        - Examples / Tutorials
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: What problem does this solve? Why is it needed?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: How would you implement this?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
