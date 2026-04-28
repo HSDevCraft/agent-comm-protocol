@@ -291,3 +291,278 @@ score = 0.50 × capability_match
 | Streaming | Not supported | SSE streaming |
 | Load balancing | None | Score-based selection |
 | Audit | None | Task history + AuditLog |
+
+---
+
+## 10. Advanced A2A Patterns
+
+### Pattern A: Capability-Aware Dynamic Routing
+
+Instead of hardcoding the receiver, let the registry find the best agent at runtime:
+
+```python
+async def delegate_dynamically(capability: str, input_data: dict) -> dict:
+    candidates = registry.find_by_capability(capability)
+    if not candidates:
+        raise ValueError(f"No agents registered for capability: {capability}")
+    
+    scored = [
+        (
+            scorer.score_agent_for_capability(
+                required_capability=capability,
+                agent_capabilities=card.capabilities,
+                agent_version=card.version,
+                agent_load=get_current_load(card.agent_id),
+                historical_success_rate=get_success_rate(card.agent_id),
+            ),
+            card
+        )
+        for card in candidates
+    ]
+    
+    best_score, best_card = max(scored, key=lambda x: x[0])
+    
+    if best_score < 0.5:
+        raise ValueError(f"No sufficiently capable agent found (best: {best_score:.2f})")
+    
+    return await a2a_client.delegate(
+        capability=capability,
+        input_data=input_data,
+        receiver_agent_id=best_card.agent_id,
+    )
+```
+
+### Pattern B: Fan-Out Delegation (Sub-Task Parallelism)
+
+One agent delegates to N agents simultaneously, then aggregates:
+
+```python
+async def fan_out_research(topics: list[str]) -> dict:
+    tasks = await asyncio.gather(*[
+        a2a_client.delegate(
+            capability="research",
+            input_data={"topic": topic},
+            correlation_id="research-batch-001",
+        )
+        for topic in topics
+    ])
+    
+    # Wait for all tasks to complete
+    completed = await asyncio.gather(*[
+        wait_for_task_completion(task.task_id, timeout=60)
+        for task in tasks
+    ])
+    
+    return {
+        "results": [t.output for t in completed if t.status == TaskStatus.COMPLETED],
+        "failed": [t.task_id for t in completed if t.status == TaskStatus.FAILED],
+    }
+```
+
+### Pattern C: Hierarchical Delegation with Depth Tracking
+
+When an agent receives a task, it can sub-delegate while respecting depth limits:
+
+```python
+async def handle_task_with_sub_delegation(task: A2ATask) -> dict:
+    current_depth = task.delegation_depth
+    
+    if current_depth >= MAX_DEPTH:
+        return execute_locally(task.input)   # must execute locally
+    
+    # Sub-delegate if beneficial
+    sub_result = await a2a_client.delegate(
+        capability="data_fetching",
+        input_data=task.input,
+        current_depth=current_depth + 1,     # increment depth
+    )
+    
+    return process_with_sub_result(task.input, sub_result.output)
+```
+
+### Pattern D: Timeout with Partial Result Acceptance
+
+```python
+async def delegate_with_timeout(capability: str, input_data: dict, timeout: float = 30.0):
+    task = await a2a_client.delegate(capability=capability, input_data=input_data, stream=True)
+    
+    last_partial_result = None
+    deadline = asyncio.get_event_loop().time() + timeout
+    
+    async for chunk in a2a_client.stream_task(task, task.receiver_id):
+        last_partial_result = chunk
+        if asyncio.get_event_loop().time() > deadline:
+            break   # accept partial result
+    
+    if last_partial_result and last_partial_result.get("pct", 0) >= 50:
+        return {"result": last_partial_result, "partial": True}
+    
+    raise TimeoutError(f"Task {task.task_id} timed out with < 50% completion")
+```
+
+---
+
+## 11. A2A Anti-Patterns to Avoid
+
+### Anti-Pattern 1: Hardcoding Receiver IDs
+
+```python
+# WRONG — brittle coupling to specific agent
+task = await a2a_client.delegate(
+    capability="financial_analysis",
+    input_data=data,
+    receiver_agent_id="finance-agent-v1",  # ← hardcoded, breaks when v2 deploys
+)
+
+# RIGHT — dynamic discovery by capability
+candidates = registry.find_by_capability("financial_analysis")
+best = score_and_select(candidates)
+task = await a2a_client.delegate(
+    capability="financial_analysis",
+    input_data=data,
+    receiver_agent_id=best.agent_id,
+)
+```
+
+### Anti-Pattern 2: Ignoring Task History
+
+```python
+# WRONG — just checking status, losing valuable debug info
+task = await a2a_client.delegate(...)
+if task.status == TaskStatus.FAILED:
+    raise RuntimeError("Task failed")
+
+# RIGHT — inspect history for root cause
+task = await a2a_client.delegate(...)
+if task.status == TaskStatus.FAILED:
+    last_event = task.history[-1]
+    logger.error("task_failed",
+                 task_id=task.task_id,
+                 last_status=last_event["status"],
+                 note=last_event["note"],
+                 retry_count=task.metadata.get("retry_count", 0))
+    raise TaskFailedError(task.task_id, task.error)
+```
+
+### Anti-Pattern 3: Unlimited Delegation Depth
+
+```python
+# WRONG — no depth enforcement
+async def delegate(self, capability, input_data):
+    # No depth check → possible infinite loops!
+    task = await self._client.delegate(capability, input_data)
+    return task
+
+# RIGHT — always track and enforce depth
+async def delegate(self, capability, input_data, current_depth=0):
+    if current_depth >= self.max_delegation_depth:
+        raise DelegationDepthExceededError(current_depth)
+    task = await self._client.delegate(
+        capability, input_data, current_depth=current_depth
+    )
+    return task
+```
+
+### Anti-Pattern 4: Using A2A for Tool Calls
+
+```python
+# WRONG — using A2A to call what should be an MCP tool
+task = await a2a_client.delegate(
+    capability="database_query",     # ← this is a TOOL, not an agent capability
+    input_data={"table": "users"},
+    receiver_agent_id="db-agent",    # ← a "wrapper agent" for a DB
+)
+
+# RIGHT — use MCP directly
+result = await mcp_client.call_tool("database_query", {"table": "users"})
+```
+
+**Rule**: If the "agent" is stateless, has no reasoning, and just wraps a single resource/API → use MCP tool. If the target performs reasoning, maintains state, or can sub-delegate → use A2A.
+
+### Anti-Pattern 5: Synchronous Polling on Long Tasks
+
+```python
+# WRONG — busy-polling wastes resources
+while True:
+    task = await fetch_task_status(task_id)
+    if task.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
+        break
+    time.sleep(0.1)     # polling every 100ms
+
+# RIGHT — use streaming (SSE) or callback
+async for chunk in a2a_client.stream_task(task, receiver_id):
+    if chunk["chunk"]["pct"] == 100:
+        return chunk["chunk"]["result"]
+```
+
+---
+
+## 12. A2A Conceptual Model — How to Think About It
+
+### The "postal mail" model
+
+A2A tasks are like certified mail with tracking:
+
+```
+Traditional function call:          A2A task delegation:
+────────────────────────            ────────────────────
+Phone call: immediate response      Certified letter: tracked journey
+No record of conversation           Full delivery history (task.history)
+Can't cancel mid-call               Cancel at any point (CANCELLED status)
+No forwarding possible              Sub-delegate (delegation_depth)
+No progress updates                 Streaming progress events
+Caller blocks until answer          Caller can do other work (async)
+```
+
+### The "task board" model
+
+Agent registry = team's shared task board:
+
+```
+AgentRegistry = {
+    "financial_analysis": [FinanceAgentCard, FinanceAgentBackupCard],
+    "legal_review":       [LegalAgentCard],
+    "report_generation":  [ReportAgentCard],
+}
+
+Posting a task (delegate):   "I need someone to do financial_analysis"
+Board checks:                Who can do it? Who's available? Who's fastest?
+Best match assigned:         FinanceAgentCard (score=0.91, load=30%)
+Task created on board:       Tracked from submission to completion
+```
+
+### The "state machine" in plain English
+
+```
+SUBMITTED:  "I've handed the letter to the post office"
+ACCEPTED:   "The recipient confirmed delivery"
+WORKING:    "They're reading it and preparing a reply"
+STREAMING:  "They're sending you progress updates along the way"
+COMPLETED:  "Reply received, letter delivered"
+FAILED:     "Letter lost, no reply, or reply says 'can't help'"
+ESCALATED:  "Post office gave up — manager intervention needed"
+CANCELLED:  "You pulled the letter back before it was delivered"
+```
+
+---
+
+## 13. Interview Questions: A2A
+
+**Q: "How is A2A different from a simple HTTP request?"**
+> HTTP is stateless: you send a request and get a response. A2A is stateful: the task object has a full lifecycle (SUBMITTED → WORKING → COMPLETED), an append-only history, support for cancellation, streaming progress, and delegation depth tracking. A2A also includes dynamic agent discovery (AgentCard registry) and capability-based routing — HTTP has none of these.
+
+**Q: "What is an AgentCard and why is it needed?"**
+> An AgentCard is a self-describing advertisement that an agent publishes so others can discover it. It contains the agent's capabilities, endpoint, input/output schemas, trust level, and rate limits. Without AgentCards, orchestrators must hardcode knowledge of every agent. With AgentCards, you can add new agents to the registry and existing orchestrators discover them automatically.
+
+**Q: "What is delegation depth and what problem does it solve?"**
+> Delegation depth is a counter (starting at 0) that increments each time a task is re-delegated. When it reaches `max_delegation_depth`, the agent must execute locally or fail. Without this, agents can form loops: A→B→C→A→... consuming infinite resources. The depth limit forces termination.
+
+**Q: "How does streaming work in A2A?"**
+> The sender creates a task with `stream=true`. The receiver sends Server-Sent Events (SSE) as it processes: each event contains a percentage complete and an optional partial result. The sender consumes events via an async generator. The final event (pct=100) contains the complete result and transitions the task to COMPLETED.
+
+**Q: "How does A2A handle agent failure?"**
+> The task transitions to FAILED with an error message in `task.error`. The `task.history` records the final state transition. The caller can then: retry the task with a different agent (re-delegate), trigger a FallbackChain (from the failure resilience layer), send to the Dead Letter Queue for manual review, or escalate to a human via the HumanEscalationHook.
+
+**Q: "Can an agent delegate to itself? How is this prevented?"**
+> Yes, without protection. Delegation depth limits prevent infinite loops, but they don't prevent self-delegation specifically. In production, add a `receiver_id != sender_id` guard and track the delegation chain in `task.metadata` to detect cycles explicitly.
+

@@ -299,3 +299,243 @@ if high_conf_result.confidence < 0.8:
         payload={"company": "ACME", "period": "Q3-2024"},
     )
 ```
+
+---
+
+## Pattern 6: Self-Healing Agent (Retry + Fallback + Observability)
+
+### Intent
+An agent that monitors its own execution, retries on transient failures, falls back to alternatives, and emits observability events — all transparently to the caller.
+
+### Structure
+
+```
+Caller
+  │
+  ▼
+SelfHealingAgent.run(query)
+  │
+  ▼ SecurityGateway.sanitize_input()
+  │
+  ▼ Check EpisodicMemory cache
+  │   HIT → return cached result (record trace: "cache_hit")
+  │
+  ▼ MISS → FailureOrchestrator.execute()
+            │
+            ▼ CircuitBreaker.call(primary_agent)
+            │   OPEN → skip to FallbackChain
+            │
+            ▼ RetryHandler.execute(primary_agent, backoff)
+            │   success → return + record in EpisodicMemory
+            │   all retries fail → FallbackChain
+            │
+            ▼ FallbackChain: [specialist, general, cached, static]
+            │   first success → return (with degraded=True flag)
+            │
+            ▼ DLQ.enqueue() + HumanEscalationHook.escalate()
+```
+
+### Implementation
+
+```python
+from src.failure.handlers import FailureOrchestrator, RetryConfig, CircuitBreakerConfig, FallbackOption
+from src.observability import ObservabilityEngine, DecisionType
+
+obs = ObservabilityEngine()
+
+class SelfHealingAgent:
+    def __init__(self, agent_id: str, primary_fn, fallback_fns: list):
+        self._fo = FailureOrchestrator(
+            agent_id=agent_id,
+            retry_config=RetryConfig(max_retries=3, base_delay_seconds=0.5),
+            circuit_config=CircuitBreakerConfig(failure_threshold=5),
+            fallback_options=[
+                FallbackOption(name=name, fn=fn, description=desc)
+                for name, fn, desc in fallback_fns
+            ],
+        )
+        self._memory = MemoryManager()
+        self._obs = obs
+
+    async def run(self, query: str) -> dict:
+        cache_key = f"result:{hash(query)}"
+        
+        cached = self._memory.read_working(cache_key, self._agent_id)
+        if cached:
+            self._obs.record_decision(
+                agent_id=self._agent_id,
+                decision="return_cached_result",
+                decision_type=DecisionType.LOCAL_EXECUTION,
+                confidence=cached.get("confidence", 0.9),
+                reasoning="Cache hit in working memory",
+            )
+            return cached
+        
+        result = await self._fo.execute(
+            self._primary_fn, query,
+            operation="primary_analysis",
+            message={"query": query},
+        )
+        
+        self._memory.write_working(
+            key=cache_key,
+            content=result,
+            agent_id=self._agent_id,
+            readable_by=["planner-agent"],
+            ttl_seconds=3600,
+        )
+        
+        return result
+```
+
+---
+
+## Pattern 7: Pattern Selection Guide
+
+### Decision Framework
+
+```
+START: What is my use case?
+         │
+         ├─ Single domain, many tools, no delegation
+         │    → Tool-Augmented Agent (Pattern 4)
+         │
+         ├─ Simple 1:1 domain handoff
+         │    → Direct A2A delegation (no pattern needed)
+         │
+         ├─ Need to classify and route requests
+         │    → Router Agent (Pattern 1)
+         │
+         ├─ Complex multi-step task, sequential dependencies
+         │    → Planner + Executor (Pattern 2)
+         │
+         ├─ Need high confidence via consensus
+         │    → Agent Swarm (Pattern 3)
+         │
+         ├─ Need resilience and self-healing
+         │    → Self-Healing Agent (Pattern 6)
+         │
+         └─ Full enterprise system with all of the above
+              → Hybrid Enterprise System (Pattern 5)
+```
+
+### Pattern Comparison Matrix
+
+| Pattern | Agents | Parallelism | Complexity | Best For |
+|---------|--------|-------------|-----------|---------|
+| Tool-Augmented | 1 | Tools only | Low | Single expert domain |
+| Router Agent | 1 + N specialists | Via A2A | Low-Medium | Classification/triage |
+| Planner + Executor | 1 + N executors | asyncio.gather | Medium | Multi-step research |
+| Agent Swarm | N identical | Full parallel | Medium | Consensus decisions |
+| Self-Healing | 1 + fallbacks | Sequential fallback | Medium | Critical ops |
+| Hybrid Enterprise | All | All types | High | Production systems |
+
+### When NOT to Use Each Pattern
+
+```
+Tool-Augmented:   Don't use if you need multiple specialized domains
+Router Agent:     Don't use if routing logic needs to learn/adapt
+Planner+Executor: Don't use for simple 1-2 step tasks (overkill)
+Agent Swarm:      Don't use if tasks have data dependencies
+Self-Healing:     Don't use if you can tolerate failure (overengineered)
+Hybrid:           Don't use for prototypes or PoCs (too complex)
+```
+
+---
+
+## Pattern 8: Pattern Anti-Patterns
+
+### Anti-Pattern 1: God Router (Putting Logic in the Router)
+
+```python
+# WRONG — router does domain work
+class BadRouter:
+    async def route(self, query: str) -> dict:
+        if "invoice" in query:
+            # Calculating invoice directly in router!
+            return self._calculate_invoice(query)   # ← domain logic in router
+        
+# RIGHT — router only routes, never executes domain logic
+class GoodRouter:
+    async def route(self, query: str) -> dict:
+        rule = self._classify(query)
+        return await self._a2a_client.delegate(
+            capability=rule.target_capability,
+            input_data={"query": query},
+        )
+```
+
+### Anti-Pattern 2: Monolithic Planner (All Logic in Decomposition)
+
+```python
+# WRONG — planner hardcodes all domain knowledge
+class BadPlanner:
+    def decompose(self, query):
+        if "ACME" in query and "Q3" in query and "revenue" in query:
+            return [step_1, step_2, step_3]   # ← every domain case in planner
+        elif "contract" in query:
+            return [legal_step_1, legal_step_2]
+        # ... hundreds of cases
+
+# RIGHT — planner uses LLM or general rules, not domain hardcoding
+class GoodPlanner:
+    async def decompose(self, query):
+        return await self._llm.decompose(
+            query=query,
+            available_capabilities=self._registry.list_capabilities(),
+        )
+```
+
+### Anti-Pattern 3: Swarm Without Aggregation Strategy
+
+```python
+# WRONG — swarm with no agreement strategy
+class BadSwarm:
+    async def run(self, query):
+        results = await asyncio.gather(*[agent.run(query) for agent in self._agents])
+        return results[0]    # ← just take the first — ignores other agents' insights
+
+# RIGHT — choose the strategy based on the use case
+class GoodSwarm:
+    async def run(self, query):
+        results = await asyncio.gather(*[agent.run(query) for agent in self._agents])
+        if self.strategy == AggregationStrategy.MAJORITY:
+            return self._majority_vote(results)
+        elif self.strategy == AggregationStrategy.BEST_CONFIDENCE:
+            return max(results, key=lambda r: r.get("confidence", 0))
+        elif self.strategy == AggregationStrategy.MERGE:
+            return self._merge_all(results)
+```
+
+### Anti-Pattern 4: Deep Nesting (Patterns Within Patterns Within Patterns)
+
+```
+WRONG:
+RouterAgent → PlannerAgent → SwarmCoordinator → PlannerAgent → RouterAgent
+(too many layers, hard to debug, high latency)
+
+RIGHT:
+RouterAgent → PlannerAgent → [SpecialistA, SpecialistB, SpecialistC] → ReportAgent
+(flat, predictable, easy to trace)
+```
+
+**Rule**: Maximum 3 layers of agent hierarchy. More than 3 layers means you need to redesign the system, not add more layers.
+
+---
+
+## Pattern 9: Interview Questions: Design Patterns
+
+**Q: "When would you use a Router Agent vs a Planner Agent?"**
+> Router Agent: when the classification is simple (keyword/rule-based), tasks are independent, and each routed-to agent handles its own complete workflow. Planner Agent: when the task requires decomposition into ordered sub-tasks with dependencies, requires parallel execution, and results need to be aggregated. Router is a traffic cop; Planner is a project manager.
+
+**Q: "What are the risks of an Agent Swarm? When does it become counter-productive?"**
+> Risks: N× resource consumption, aggregation complexity, consistency issues if agents disagree. Counter-productive when: tasks have data dependencies (result of A needed for B), a single authoritative source exists (swarm adds noise), or N × latency > acceptable response time. Use swarms only for consensus-critical or embarrassingly parallel workloads.
+
+**Q: "How does the Planner+Executor pattern handle partial failures?"**
+> The planner runs `asyncio.gather(return_exceptions=True)` so failures don't cancel successful parallel tasks. For each completed step, results are stored in context. For failed steps: retry with a different executor, continue with available results (mark step as degraded), or abort if the failed step is a dependency of remaining steps.
+
+**Q: "How does the Hybrid Enterprise pattern prevent the system from becoming a monolith?"**
+> Each layer is independent: Router classifies (no domain logic), Planner decomposes (no domain execution), Executors handle domain logic (no orchestration), Swarm provides redundancy (no state). Separation of concerns means you can swap out any component — replace the router's keyword rules with ML classification without touching any other layer.
+
+**Q: "What's the difference between ACP workflow orchestration and the Planner+Executor pattern?"**
+> They solve the same problem at different levels. Planner+Executor is a design pattern — an architectural choice for how agents decompose and dispatch work. ACP workflow is an implementation mechanism — a message-based protocol for async fan-out with TTL, retry policies, and correlation IDs. In production, the Planner+Executor pattern uses ACP as its communication backbone.
