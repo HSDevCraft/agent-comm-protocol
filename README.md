@@ -2,7 +2,6 @@
 
 > Production-grade, explainable, and extensible multi-agent communication system implementing **MCP**, **A2A**, **ACP**, and **ANP** — four complementary protocols that together form a complete agent ecosystem.
 
-[![CI](https://github.com/your-org/agent-comm-protocol/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/agent-comm-protocol/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12-blue.svg)](https://www.python.org)
 [![Tests](https://img.shields.io/badge/tests-291%20passed-brightgreen.svg)](#testing)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
